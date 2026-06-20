@@ -9,11 +9,14 @@ from fastmcp import FastMCP
 
 from airbyte_mcp.client import (
     AirbyteClient,
+    connection_index,
     enrich_job,
+    find_duplicate_destination_tables as detect_duplicate_destination_tables,
     normalize_attempts,
     parse_envs,
     resolve_client,
     resolve_connection_ref,
+    summarize_connection,
 )
 
 AIRBYTE_URL = os.environ.get("AIRBYTE_URL", "http://localhost:8000")
@@ -35,7 +38,8 @@ mcp = FastMCP(
         f"Use these tools to monitor a self-hosted Airbyte OSS instance ({_mode} mode). "
         f"{_env_info}"
         "Start with get_instance_status or get_active_syncs to see what is running, "
-        "then list_connections / list_jobs / get_job_failure_summary to drill in."
+        "then list_connections / list_jobs / get_job_failure_summary to drill in. "
+        "Use find_duplicate_destination_tables to audit BigQuery table conflicts."
     ),
 )
 
@@ -51,17 +55,7 @@ def _client(env: str | None = None) -> AirbyteClient:
 
 
 def _connection_maps(client: AirbyteClient) -> dict[str, dict[str, dict[str, Any]]]:
-    connections = client.list_connections(limit=100)
-    by_id: dict[str, dict[str, Any]] = {}
-    by_name: dict[str, dict[str, Any]] = {}
-    for conn in connections:
-        conn_id = conn.get("connectionId")
-        name = conn.get("name")
-        if conn_id:
-            by_id[str(conn_id)] = conn
-        if name:
-            by_name[str(name)] = conn
-    return {"by_id": by_id, "by_name": by_name}
+    return connection_index(client.list_all_connections())
 
 
 @mcp.tool()
@@ -74,7 +68,7 @@ def get_instance_status(env: str | None = None) -> dict[str, Any]:
     client = _client(env)
     health = client.health()
     workspaces = client.list_workspaces()
-    connections = client.list_connections(limit=100)
+    connections = client.list_all_connections()
 
     status_counts: dict[str, int] = {}
     schedule_counts: dict[str, int] = {}
@@ -84,9 +78,9 @@ def get_instance_status(env: str | None = None) -> dict[str, Any]:
         sched = (conn.get("schedule") or {}).get("scheduleType", "unknown")
         schedule_counts[str(sched)] = schedule_counts.get(str(sched), 0) + 1
 
-    running = client.list_jobs(status="running", limit=100)
-    pending = client.list_jobs(status="pending", limit=100)
-    failed_recent = client.list_jobs(status="failed", limit=20)
+    running = client.list_all_jobs(status="running")
+    pending = client.list_all_jobs(status="pending")
+    failed_recent = client.list_jobs_limited(20, status="failed")
 
     return {
         "healthy": health.lower() in ("ok", "successful operation"),
@@ -106,6 +100,7 @@ def list_connections(
     name_prefix: str | None = None,
     status: str | None = None,
     limit: int = 100,
+    offset: int = 0,
     env: str | None = None,
 ) -> list[dict[str, Any]]:
     """List Airbyte connections with schedule and status metadata.
@@ -113,9 +108,11 @@ def list_connections(
     Filters:
     - name_prefix: case-insensitive substring on connection name
     - status: exact status filter (e.g. 'active')
+    - limit: max results (paginates beyond the 100-item API page size when needed)
+    - offset: skip first N connections from the API ordering
     """
     client = _client(env)
-    connections = client.list_connections(limit=min(max(limit, 1), 100))
+    connections = client.list_connections_limited(limit=max(limit, 1), offset=max(offset, 0))
 
     if name_prefix:
         needle = name_prefix.lower()
@@ -143,7 +140,8 @@ def list_connections(
 def get_connection(connection: str, env: str | None = None) -> dict[str, Any]:
     """Get one connection by exact name or connectionId UUID.
 
-    Also returns the three most recent sync jobs for that connection.
+    Returns connection metadata with stream summaries (name, namespace, prefix, syncMode)
+    and the three most recent sync jobs.
     """
     client = _client(env)
     index = _connection_maps(client)
@@ -152,7 +150,7 @@ def get_connection(connection: str, env: str | None = None) -> dict[str, Any]:
     detail = client.get_connection(conn_id)
     jobs = client.list_jobs(connection_id=conn_id, limit=3)
     return {
-        "connection": detail,
+        "connection": summarize_connection(detail),
         "recentJobs": jobs,
     }
 
@@ -162,6 +160,7 @@ def list_jobs(
     connection: str | None = None,
     status: str | None = None,
     limit: int = 20,
+    offset: int = 0,
     env: str | None = None,
 ) -> list[dict[str, Any]]:
     """List recent sync jobs, newest first.
@@ -172,6 +171,8 @@ def list_jobs(
     Filters:
     - connection: connection name, UUID, or substring (must match exactly one)
     - status: pending, running, incomplete, failed, succeeded, cancelled
+    - limit: max results (paginates beyond the 100-item API page size when needed)
+    - offset: skip first N jobs from the API ordering
     """
     client = _client(env)
     index = _connection_maps(client)
@@ -180,10 +181,11 @@ def list_jobs(
         conn = resolve_connection_ref(connection, index)
         connection_id = str(conn["connectionId"])
 
-    jobs = client.list_jobs(
+    jobs = client.list_jobs_limited(
+        limit=max(limit, 1),
+        offset=max(offset, 0),
         connection_id=connection_id,
         status=status,
-        limit=min(max(limit, 1), 100),
     )
     return [enrich_job(job, index["by_id"]) for job in jobs]
 
@@ -197,8 +199,19 @@ def get_active_syncs(env: str | None = None) -> list[dict[str, Any]]:
     """
     client = _client(env)
     index = _connection_maps(client)
-    jobs = client.list_jobs(status="running", limit=100)
+    jobs = client.list_all_jobs(status="running")
     return [enrich_job(job, index["by_id"]) for job in jobs]
+
+
+@mcp.tool()
+def find_duplicate_destination_tables(env: str | None = None) -> dict[str, Any]:
+    """Detect multiple active connections writing the same BigQuery project.dataset.table.
+
+    Best-effort audit using connection stream config and destination settings.
+    Skips non-BigQuery destinations and inactive connections.
+    """
+    client = _client(env)
+    return detect_duplicate_destination_tables(client)
 
 
 @mcp.tool()

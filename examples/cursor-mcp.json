@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "airbyte": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/NGRThomson/airbyte-oss-mcp.git@v0.2.0",
+        "airbyte-mcp"
+      ],
+      "env": {
+        "AIRBYTE_URL": "http://localhost:8000",
+        "AIRBYTE_READ_ONLY": "true"
+      }
+    }
+  }
+}

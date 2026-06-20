@@ -39,8 +39,10 @@ Replace `AIRBYTE_URL` with your instance URL. Default (if unset) is `http://loca
 Pin a tag or commit for slower upgrades:
 
 ```text
-git+https://github.com/NGRThomson/airbyte-oss-mcp.git@v0.1.0
+git+https://github.com/NGRThomson/airbyte-oss-mcp.git@v0.2.0
 ```
+
+See [`examples/cursor-mcp.json`](examples/cursor-mcp.json) for a team install template.
 
 Optional persistent install:
 
@@ -58,7 +60,9 @@ Or:
 
 ```bash
 cd airbyte-oss-mcp
-uv sync
+uv sync --extra dev
+uv run ruff check airbyte_mcp/
+uv run pytest
 uv run airbyte-mcp
 ```
 
@@ -97,6 +101,7 @@ Optional bearer token:
 | `get_job` | Public job metadata |
 | `get_job_details` | Attempt stats + failure summaries |
 | `get_job_failure_summary` | Best starting point for failed syncs |
+| `find_duplicate_destination_tables` | Audit BigQuery tables with multiple active writers |
 
 Write tools (`cancel_job`, `trigger_sync`) register only when `AIRBYTE_READ_ONLY=false`.
 
@@ -115,4 +120,6 @@ print('running', len(c.list_jobs(status='running', limit=10)))
 
 - Always pass `orderBy=updatedAt|DESC` when listing jobs (default in client) — otherwise Airbyte returns oldest jobs first.
 - Raw job logs are not exposed (public API has no log endpoint); failure summaries come from internal `get_without_logs`.
+- **Internal OSS API:** `get_job_details` and `get_job_failure_summary` use `/api/v1/jobs/get_without_logs`, which is not part of the public API and may break on Airbyte upgrades.
+- `list_connections` / `list_jobs` paginate automatically when `limit` exceeds the API page size (100).
 - **Runtime data:** when pointed at a live instance, tool responses include connection names, job errors, and IDs from *your* Airbyte workspace — keep MCP read-only in shared Cursor configs if that metadata is sensitive.

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
 
 DEFAULT_ORDER_BY = "updatedAt|DESC"
+API_PAGE_SIZE = 100
 
 
 class AirbyteClient:
@@ -123,8 +126,24 @@ class AirbyteClient:
         )
         return payload.get("data", [])
 
+    def list_all_connections(
+        self,
+        *,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        return _fetch_all_pages(
+            lambda limit, offset: self.list_connections(
+                limit=limit,
+                offset=offset,
+                include_deleted=include_deleted,
+            ),
+        )
+
     def get_connection(self, connection_id: str) -> dict[str, Any]:
         return self._get(f"{self.public_base}/connections/{connection_id}")
+
+    def get_destination(self, destination_id: str) -> dict[str, Any]:
+        return self._get(f"{self.public_base}/destinations/{destination_id}")
 
     def list_jobs(
         self,
@@ -156,6 +175,57 @@ class AirbyteClient:
         payload = self._get(f"{self.public_base}/jobs", params)
         return payload.get("data", [])
 
+    def list_all_jobs(
+        self,
+        *,
+        connection_id: str | None = None,
+        status: str | None = None,
+        job_type: str = "sync",
+        order_by: str = DEFAULT_ORDER_BY,
+        created_at_start: str | None = None,
+        created_at_end: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return _fetch_all_pages(
+            lambda limit, offset: self.list_jobs(
+                connection_id=connection_id,
+                status=status,
+                job_type=job_type,
+                limit=limit,
+                offset=offset,
+                order_by=order_by,
+                created_at_start=created_at_start,
+                created_at_end=created_at_end,
+            ),
+        )
+
+    def list_jobs_limited(
+        self,
+        limit: int,
+        offset: int = 0,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        return _fetch_limited(
+            lambda limit, offset: self.list_jobs(limit=limit, offset=offset, **kwargs),
+            limit=max(limit, 1),
+            offset=max(offset, 0),
+        )
+
+    def list_connections_limited(
+        self,
+        limit: int,
+        offset: int = 0,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        return _fetch_limited(
+            lambda limit, offset: self.list_connections(
+                limit=limit,
+                offset=offset,
+                **kwargs,
+            ),
+            limit=max(limit, 1),
+            offset=max(offset, 0),
+        )
+
     def get_job_public(self, job_id: int) -> dict[str, Any]:
         return self._get(f"{self.public_base}/jobs/{job_id}")
 
@@ -170,6 +240,45 @@ class AirbyteClient:
             f"{self.public_base}/jobs",
             {"connectionId": connection_id, "jobType": "sync"},
         )
+
+
+def _fetch_all_pages(
+    fetch_page: Callable[[int, int], list[dict[str, Any]]],
+    *,
+    page_size: int = API_PAGE_SIZE,
+) -> list[dict[str, Any]]:
+    offset = 0
+    items: list[dict[str, Any]] = []
+    while True:
+        page = fetch_page(page_size, offset)
+        if not page:
+            break
+        items.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return items
+
+
+def _fetch_limited(
+    fetch_page: Callable[[int, int], list[dict[str, Any]]],
+    limit: int,
+    offset: int = 0,
+    *,
+    page_size: int = API_PAGE_SIZE,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    current_offset = offset
+    while len(items) < limit:
+        to_fetch = min(page_size, limit - len(items))
+        page = fetch_page(to_fetch, current_offset)
+        if not page:
+            break
+        items.extend(page)
+        if len(page) < to_fetch:
+            break
+        current_offset += len(page)
+    return items[:limit]
 
 
 def parse_envs(raw: str) -> dict[str, dict[str, str]]:
@@ -286,3 +395,157 @@ def normalize_attempts(raw: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return attempts
+
+
+def summarize_connection(detail: dict[str, Any]) -> dict[str, Any]:
+    """Return connection metadata and stream summaries without the raw configurations blob."""
+    conn_prefix = detail.get("prefix") or ""
+    namespace_format = detail.get("namespaceFormat") or ""
+    streams_raw = (detail.get("configurations") or {}).get("streams") or []
+    streams: list[dict[str, Any]] = []
+    for stream in streams_raw:
+        s_cfg = stream.get("config") or stream
+        name = stream.get("name") or s_cfg.get("name")
+        if not name:
+            continue
+        streams.append(
+            {
+                "name": name,
+                "namespace": s_cfg.get("namespace") or namespace_format or None,
+                "prefix": s_cfg.get("prefix") or conn_prefix or None,
+                "syncMode": stream.get("syncMode") or s_cfg.get("syncMode"),
+            }
+        )
+    return {
+        "connectionId": detail.get("connectionId"),
+        "name": detail.get("name"),
+        "status": detail.get("status"),
+        "schedule": detail.get("schedule"),
+        "prefix": detail.get("prefix"),
+        "namespaceDefinition": detail.get("namespaceDefinition"),
+        "namespaceFormat": detail.get("namespaceFormat"),
+        "sourceId": detail.get("sourceId"),
+        "destinationId": detail.get("destinationId"),
+        "workspaceId": detail.get("workspaceId"),
+        "streams": streams,
+    }
+
+
+def _bq_config_value(cfg: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = cfg.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def is_bigquery_destination(dest: dict[str, Any]) -> bool:
+    dest_type = str(dest.get("destinationType") or dest.get("definitionId") or "").lower()
+    if "bigquery" in dest_type:
+        return True
+    cfg = dest.get("configuration") or {}
+    return bool(_bq_config_value(cfg, "project_id", "projectId"))
+
+
+def resolve_bq_dataset(
+    connection: dict[str, Any],
+    stream: dict[str, Any],
+    dest_cfg: dict[str, Any],
+) -> str | None:
+    default_dataset = _bq_config_value(
+        dest_cfg,
+        "dataset_id",
+        "dataset",
+        "defaultDatasetId",
+    )
+    s_cfg = stream.get("config") or stream
+    stream_namespace = s_cfg.get("namespace")
+    namespace_def = (
+        connection.get("namespaceDefinition")
+        or connection.get("namespaceDefinitionType")
+        or "destination"
+    )
+    namespace_format = connection.get("namespaceFormat") or ""
+
+    if namespace_def == "source":
+        return stream_namespace or default_dataset
+    if namespace_def == "custom_format":
+        if namespace_format == "${SOURCE_NAMESPACE}":
+            return stream_namespace or default_dataset
+        if namespace_format:
+            if stream_namespace and "${SOURCE_NAMESPACE}" in namespace_format:
+                return namespace_format.replace("${SOURCE_NAMESPACE}", stream_namespace)
+            return namespace_format
+        return default_dataset
+    return default_dataset
+
+
+def resolve_bq_table_name(connection: dict[str, Any], stream: dict[str, Any]) -> str | None:
+    s_cfg = stream.get("config") or stream
+    name = stream.get("name") or s_cfg.get("name")
+    if not name:
+        return None
+    dest_object = stream.get("destination_object_name") or s_cfg.get("destination_object_name")
+    if dest_object:
+        return str(dest_object)
+    conn_prefix = connection.get("prefix") or ""
+    stream_prefix = s_cfg.get("prefix") or conn_prefix or ""
+    return f"{stream_prefix}{name}" if stream_prefix else str(name)
+
+
+def bq_destination_key(project: str, dataset: str, table: str) -> str:
+    return f"{project}.{dataset}.{table}"
+
+
+def find_duplicate_destination_tables(client: AirbyteClient) -> dict[str, Any]:
+    """Detect multiple active connections writing the same BigQuery project.dataset.table."""
+    connections = client.list_all_connections()
+    dest_cache: dict[str, dict[str, Any]] = {}
+    writers: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for conn in connections:
+        if conn.get("status") != "active":
+            continue
+        conn_id = str(conn["connectionId"])
+        detail = client.get_connection(conn_id)
+        dest_id = str(detail.get("destinationId") or "")
+        if not dest_id:
+            continue
+
+        if dest_id not in dest_cache:
+            dest_cache[dest_id] = client.get_destination(dest_id)
+        dest = dest_cache[dest_id]
+        if not is_bigquery_destination(dest):
+            continue
+
+        dest_cfg = dest.get("configuration") or {}
+        project = _bq_config_value(dest_cfg, "project_id", "projectId")
+        if not project:
+            continue
+        dest_name = dest.get("name", "?")
+
+        for stream in (detail.get("configurations") or {}).get("streams") or []:
+            dataset = resolve_bq_dataset(detail, stream, dest_cfg)
+            table = resolve_bq_table_name(detail, stream)
+            if not dataset or not table:
+                continue
+            key = bq_destination_key(project, dataset, table)
+            writers[key].append(
+                {
+                    "connection": detail.get("name"),
+                    "connectionId": conn_id,
+                    "destination": dest_name,
+                    "dataset": dataset,
+                    "table": table,
+                    "scheduleType": (detail.get("schedule") or {}).get("scheduleType"),
+                }
+            )
+
+    active_count = sum(1 for c in connections if c.get("status") == "active")
+    dupes = {k: v for k, v in writers.items() if len(v) > 1}
+    return {
+        "active_connection_count": active_count,
+        "unique_destination_tables": len(writers),
+        "duplicate_destination_table_count": len(dupes),
+        "duplicates": dict(sorted(dupes.items())),
+    }
