@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-06-20
+
+### Removed
+
+- `get_active_syncs` — use `list_jobs` with status filter instead
+- `find_duplicate_destination_tables` — workflow-specific BigQuery audit
+- `suggestions` field from `get_job_failure_summary` responses
+
+### Changed
+
+- `get_instance_status` uses bounded connection/job samples instead of full paginated scans
+- Server instructions are generic (no workflow routing); compose tools in skills as needed
+
 ## [0.2.0] - 2026-06-20
 
 ### Added

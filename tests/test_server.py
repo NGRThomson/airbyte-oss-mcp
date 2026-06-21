@@ -102,6 +102,58 @@ class TestListConnectionsPagination:
         assert mock_get.call_count == 2
 
 
+class TestGetInstanceStatus:
+    def test_uses_bounded_fetches(self, monkeypatch):
+        calls: list[str] = []
+
+        def route(url, **kwargs):
+            calls.append(url)
+            response = MagicMock()
+            response.status_code = 200
+            if url.endswith("/health"):
+                response.text = "Successful operation"
+                response.content = response.text.encode()
+            elif "/workspaces" in url:
+                response.json.return_value = {"data": [{"workspaceId": "ws-1"}]}
+                response.content = b"{}"
+                response.text = "{}"
+            elif "/connections" in url:
+                response.json.return_value = {
+                    "data": [
+                        {
+                            "connectionId": "c1",
+                            "status": "active",
+                            "schedule": {"scheduleType": "manual"},
+                        }
+                    ]
+                }
+                response.content = b"{}"
+                response.text = "{}"
+            elif "/jobs" in url:
+                response.json.return_value = {
+                    "data": [
+                        {"jobId": 1, "status": "running"},
+                        {"jobId": 2, "status": "failed"},
+                    ]
+                }
+                response.content = b"{}"
+                response.text = "{}"
+            else:
+                response.json.return_value = {}
+                response.content = b"{}"
+                response.text = "{}"
+            return response
+
+        monkeypatch.setattr(httpx, "get", MagicMock(side_effect=route))
+        result = server.get_instance_status()
+        assert result["healthy"] is True
+        assert result["running_sync_count"] == 1
+        assert result["recent_failed_sync_count"] == 1
+        assert "job_counts_note" in result
+        assert sum(1 for url in calls if "/jobs" in url) == 1
+        assert not any("status=running" in url for url in calls)
+
+
 class TestReadOnlyGating:
     def test_write_tools_not_registered_when_read_only(self):
         assert server.READ_ONLY is True
@@ -109,30 +161,11 @@ class TestReadOnlyGating:
         tool_names = {t.name for t in tools}
         assert "cancel_job" not in tool_names
         assert "trigger_sync" not in tool_names
-        assert "find_duplicate_destination_tables" in tool_names
+        assert "get_active_syncs" not in tool_names
+        assert "find_duplicate_destination_tables" not in tool_names
+        assert "get_instance_status" in tool_names
 
     def test_write_tools_registered_when_not_read_only(self, monkeypatch):
         monkeypatch.setattr(server, "READ_ONLY", False)
         assert hasattr(server, "cancel_job")
         assert hasattr(server, "trigger_sync")
-
-
-class TestFindDuplicateDestinationTablesTool:
-    def test_tool_delegates_to_client(self, monkeypatch):
-        expected = {
-            "active_connection_count": 0,
-            "unique_destination_tables": 0,
-            "duplicate_destination_table_count": 0,
-            "duplicates": {},
-        }
-        monkeypatch.setattr(
-            server,
-            "detect_duplicate_destination_tables",
-            lambda client: expected,
-        )
-        monkeypatch.setattr(
-            server,
-            "_client",
-            lambda env=None: MagicMock(),
-        )
-        assert server.find_duplicate_destination_tables() == expected

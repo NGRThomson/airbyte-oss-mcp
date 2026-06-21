@@ -11,7 +11,6 @@ from airbyte_mcp.client import (
     AirbyteClient,
     connection_index,
     enrich_job,
-    find_duplicate_destination_tables as detect_duplicate_destination_tables,
     normalize_attempts,
     parse_envs,
     resolve_client,
@@ -35,11 +34,9 @@ _env_info = (
 mcp = FastMCP(
     "airbyte",
     instructions=(
-        f"Use these tools to monitor a self-hosted Airbyte OSS instance ({_mode} mode). "
+        f"Read-only wrapper for a self-hosted Airbyte OSS instance ({_mode} mode). "
         f"{_env_info}"
-        "Start with get_instance_status or get_active_syncs to see what is running, "
-        "then list_connections / list_jobs / get_job_failure_summary to drill in. "
-        "Use find_duplicate_destination_tables to audit BigQuery table conflicts."
+        "Tools map to API endpoints — compose them in skills and workflows as needed."
     ),
 )
 
@@ -58,17 +55,23 @@ def _connection_maps(client: AirbyteClient) -> dict[str, dict[str, dict[str, Any
     return connection_index(client.list_all_connections())
 
 
+_INSTANCE_STATUS_JOBS_SAMPLE = 50
+_INSTANCE_STATUS_CONNECTIONS_SAMPLE = 100
+
+
 @mcp.tool()
 def get_instance_status(env: str | None = None) -> dict[str, Any]:
-    """Global Airbyte health snapshot. Start here for monitoring workflows.
+    """Global Airbyte health snapshot.
 
     Returns health text, workspace count, connection counts by status,
-    and counts of running / pending / failed sync jobs (recent sample).
+    and counts of running / pending / failed sync jobs from bounded samples.
+    Job counts reflect the most recently updated jobs only (see job_counts_note).
     """
     client = _client(env)
     health = client.health()
     workspaces = client.list_workspaces()
-    connections = client.list_all_connections()
+    connections = client.list_connections_limited(_INSTANCE_STATUS_CONNECTIONS_SAMPLE)
+    jobs_sample = client.list_jobs_limited(_INSTANCE_STATUS_JOBS_SAMPLE)
 
     status_counts: dict[str, int] = {}
     schedule_counts: dict[str, int] = {}
@@ -78,9 +81,9 @@ def get_instance_status(env: str | None = None) -> dict[str, Any]:
         sched = (conn.get("schedule") or {}).get("scheduleType", "unknown")
         schedule_counts[str(sched)] = schedule_counts.get(str(sched), 0) + 1
 
-    running = client.list_all_jobs(status="running")
-    pending = client.list_all_jobs(status="pending")
-    failed_recent = client.list_jobs_limited(20, status="failed")
+    running = [j for j in jobs_sample if j.get("status") == "running"]
+    pending = [j for j in jobs_sample if j.get("status") == "pending"]
+    failed = [j for j in jobs_sample if j.get("status") == "failed"]
 
     return {
         "healthy": health.lower() in ("ok", "successful operation"),
@@ -91,7 +94,11 @@ def get_instance_status(env: str | None = None) -> dict[str, Any]:
         "connections_by_schedule_type": schedule_counts,
         "running_sync_count": len(running),
         "pending_sync_count": len(pending),
-        "recent_failed_sync_count": len(failed_recent),
+        "recent_failed_sync_count": len(failed),
+        "job_counts_note": (
+            f"Running/pending/failed counts are from the {_INSTANCE_STATUS_JOBS_SAMPLE} "
+            "most recently updated jobs."
+        ),
     }
 
 
@@ -191,30 +198,6 @@ def list_jobs(
 
 
 @mcp.tool()
-def get_active_syncs(env: str | None = None) -> list[dict[str, Any]]:
-    """List all currently running sync jobs with connection names.
-
-    Best tool to answer 'what is blocking the Airbyte worker pool?' or
-    'why is this sync taking so long?'
-    """
-    client = _client(env)
-    index = _connection_maps(client)
-    jobs = client.list_all_jobs(status="running")
-    return [enrich_job(job, index["by_id"]) for job in jobs]
-
-
-@mcp.tool()
-def find_duplicate_destination_tables(env: str | None = None) -> dict[str, Any]:
-    """Detect multiple active connections writing the same BigQuery project.dataset.table.
-
-    Best-effort audit using connection stream config and destination settings.
-    Skips non-BigQuery destinations and inactive connections.
-    """
-    client = _client(env)
-    return detect_duplicate_destination_tables(client)
-
-
-@mcp.tool()
 def get_job(job_id: int, env: str | None = None) -> dict[str, Any]:
     """Get public job metadata for a sync job id."""
     client = _client(env)
@@ -296,27 +279,7 @@ def get_job_failure_summary(job_id: int, env: str | None = None) -> dict[str, An
         "rowsSynced": enriched.get("rowsSynced"),
         "failedAttemptCount": len(failed_attempts),
         "rootCauseFailures": root_messages,
-        "suggestions": _failure_suggestions(root_messages, enriched),
     }
-
-
-def _failure_suggestions(
-    failures: list[dict[str, Any]],
-    job: dict[str, Any],
-) -> list[str]:
-    suggestions: list[str] = []
-    blob = " ".join(f.get("message", "") for f in failures).lower()
-    if "quota exceeded" in blob or "rate limit" in blob:
-        suggestions.append("Destination quota/rate limit hit — retry later or raise quota.")
-    if "timeout" in blob:
-        suggestions.append("Sync timed out — consider narrowing streams or raising worker resources.")
-    if job.get("duration") and str(job["duration"]).startswith("PT") and "H" in str(job["duration"]):
-        suggestions.append(
-            "Long-running sync — check worker pool concurrency limits in your orchestrator."
-        )
-    if not suggestions:
-        suggestions.append("Use Airbyte UI job logs for full stack traces if needed.")
-    return suggestions
 
 
 def cancel_job(job_id: int, env: str | None = None) -> dict[str, Any]:

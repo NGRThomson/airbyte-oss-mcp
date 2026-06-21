@@ -39,7 +39,7 @@ Replace `AIRBYTE_URL` with your instance URL. Default (if unset) is `http://loca
 Pin a tag or commit for slower upgrades:
 
 ```text
-git+https://github.com/NGRThomson/airbyte-oss-mcp.git@v0.2.0
+git+https://github.com/NGRThomson/airbyte-oss-mcp.git@v0.3.0
 ```
 
 See [`examples/cursor-mcp.json`](examples/cursor-mcp.json) for a team install template.
@@ -93,15 +93,13 @@ Optional bearer token:
 
 | Tool | Purpose |
 |------|---------|
-| `get_instance_status` | Health, connection counts, running/pending/failed job counts |
-| `get_active_syncs` | All running syncs with connection names |
+| `get_instance_status` | Health, connection counts, running/pending/failed job counts (bounded samples) |
 | `list_connections` | Browse/filter connections |
 | `get_connection` | One connection + recent jobs |
 | `list_jobs` | Recent jobs (filter by connection/status) |
 | `get_job` | Public job metadata |
 | `get_job_details` | Attempt stats + failure summaries |
-| `get_job_failure_summary` | Best starting point for failed syncs |
-| `find_duplicate_destination_tables` | Audit BigQuery tables with multiple active writers |
+| `get_job_failure_summary` | Root-cause failure messages for a failed sync |
 
 Write tools (`cancel_job`, `trigger_sync`) register only when `AIRBYTE_READ_ONLY=false`.
 
